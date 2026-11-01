@@ -26,7 +26,10 @@ FB_PROJECT = os.environ.get("FB_PROJECT", "arzon-prays")
 FS = f"https://firestore.googleapis.com/v1/projects/{FB_PROJECT}/databases/(default)/documents"
 CHUNK = 900_000            # bitta Firestore hujjatiga sig'adigan base64 bo'lak
 MAX_BYTES = 8 * 1024 * 1024
-SCAN_LIMIT = 40            # kanaldagi oxirgi nechta xabar ko'riladi
+SCAN_LIMIT = 60            # kanaldagi oxirgi nechta FAYLLI xabar ko'riladi
+FOLDER = os.environ.get("TG_FOLDER", "FIRMALAR")  # Telegramdagi ta'minotchilar papkasi
+# shu so'zlar fayl nomida bo'lsa — bu prays emas (masalan, "Новый приход" — narxsiz yangi kelganlar e'loni)
+SKIP_WORDS = ("приход", "prixod", "prihod", "новинк")
 EXCEL = (".xlsx", ".xls", ".xlsm")
 PDF_NEWER_HOURS = 12       # PDF Excel'dan shuncha soat yangi bo'lsagina PDF tanlanadi
 
@@ -158,12 +161,24 @@ def kind_of(name: str):
     return None
 
 
-def pick(messages):
-    """Eng yangi Excel; Excel umuman yo'q yoki PDF ancha yangi bo'lsa — PDF."""
+def name_ok(name: str, match: str = "") -> bool:
+    n = (name or "").lower()
+    if any(w in n for w in SKIP_WORDS):
+        return False
+    words = [w.strip().lower() for w in re.split(r"[,;]", match or "") if w.strip()]
+    return not words or any(w in n for w in words)
+
+
+def pick(messages, match: str = ""):
+    """Eng yangi Excel; Excel umuman yo'q yoki PDF ancha yangi bo'lsa — PDF.
+    "приход" fayllari va (agar berilgan bo'lsa) nomida kalit so'z bo'lmagan fayllar o'tkazib yuboriladi."""
     ex = pd = None
     for m in messages:  # yangidan eskiga
         f = getattr(m, "file", None)
-        k = kind_of(getattr(f, "name", None)) if f else None
+        name = getattr(f, "name", None) if f else None
+        k = kind_of(name)
+        if not k or not name_ok(name, match):
+            continue
         if k == "xlsx" and ex is None:
             ex = m
         elif k == "pdf" and pd is None:
@@ -177,24 +192,80 @@ def pick(messages):
     return ex, "xlsx"
 
 
-async def run(fb: Firebase, client, log=print):
+def _title(t):
+    return getattr(t, "text", t) if t is not None else ""
+
+
+async def read_folder(client, fb, log=print):
+    """Telegramdagi FOLDER papkasidagi chatlar ro'yxatini "tgprice/_chats" ga yozadi; {chat_id: entity} qaytaradi."""
+    from telethon.tl.functions.messages import GetDialogFiltersRequest
+    from telethon import utils
+    res = await client(GetDialogFiltersRequest())
+    filters = getattr(res, "filters", res)
+    folder = None
+    for f in filters or []:
+        if _title(getattr(f, "title", None)).strip().lower() == FOLDER.lower():
+            folder = f
+            break
+    out, ents = [], {}
+    if folder is None:
+        log(f"'{FOLDER}' papkasi topilmadi")
+    else:
+        peers = list(getattr(folder, "pinned_peers", []) or []) + list(getattr(folder, "include_peers", []) or [])
+        for p in peers:
+            try:
+                e = await client.get_entity(p)
+            except Exception as ex:  # noqa
+                log(f"papkadagi chatni ochib bo'lmadi: {ex}")
+                continue
+            cid = str(utils.get_peer_id(e))
+            if cid in ents:
+                continue
+            ents[cid] = e
+            out.append({"id": cid, "title": getattr(e, "title", None) or getattr(e, "first_name", "") or cid,
+                        "username": getattr(e, "username", None) or ""})
+    fb.set("tgprice/_chats", {"folder": FOLDER, "found": folder is not None, "chats": out,
+                              "at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
+    log(f"Papkada {len(out)} ta chat")
+    return ents
+
+
+async def run(fb: Firebase, client, log=print, folder_reader=None):
     now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     status = {"lastRun": now, "checked": [], "updated": [], "errors": {}}
+    try:
+        ents = await (folder_reader or read_folder)(client, fb, log)
+    except Exception as e:
+        ents = {}
+        status["folderError"] = f"{type(e).__name__}: {e}"[:200]
+        log("papkani o'qib bo'lmadi: " + status["folderError"])
     sup = fb.list("supinfo")
-    targets = {sid: i for sid, i in sup.items() if i.get("tgAuto") and (i.get("tgPrice") or "").strip()}
-    log(f"Kuzatiladigan kanallar: {len(targets)}")
+    targets = {sid: i for sid, i in sup.items()
+               if i.get("tgAuto") and ((i.get("tgChat") or "").strip() or (i.get("tgPrice") or "").strip())}
+    log(f"Kuzatiladigan ta'minotchilar: {len(targets)}")
     for sid, info in targets.items():
-        ref = channel_ref(info["tgPrice"])
+        chat = (info.get("tgChat") or "").strip()
+        source = chat or info["tgPrice"].strip()
         try:
-            ent = await client.get_entity(ref)
-            msgs = [m async for m in client.iter_messages(ent, limit=SCAN_LIMIT)]
-            m, kind = pick(msgs)
+            if chat:
+                ent = ents.get(chat)
+                if ent is None:
+                    ent = await client.get_entity(int(chat))
+            else:
+                ent = await client.get_entity(channel_ref(info["tgPrice"]))
+            try:
+                from telethon.tl.types import InputMessagesFilterDocument
+                flt = {"filter": InputMessagesFilterDocument}
+            except Exception:
+                flt = {}
+            msgs = [m async for m in client.iter_messages(ent, limit=SCAN_LIMIT, **flt)]
+            m, kind = pick(msgs, info.get("tgMatch") or "")
             status["checked"].append(sid)
             if m is None:
-                status["errors"][sid] = "kanalda Excel yoki PDF fayl topilmadi"
+                status["errors"][sid] = ("kalit so'z bo'yicha fayl topilmadi: " + info["tgMatch"]) if info.get("tgMatch") else "kanalda Excel yoki PDF fayl topilmadi"
                 continue
             prev = fb.get(f"tgprice/{sid}") or {}
-            if prev.get("tgId") == m.id and prev.get("channel") == info["tgPrice"]:
+            if prev.get("tgId") == m.id and prev.get("channel") == source:
                 log(f"{sid}: yangi fayl yo'q ({prev.get('fileName')})")
                 continue
             size = getattr(m.file, "size", 0) or 0
@@ -208,7 +279,7 @@ async def run(fb: Firebase, client, log=print):
             n = fb.put_file(sid, data, prev_files.get("n", 0), {"fileName": m.file.name})
             fb.set(f"tgprice/{sid}", {"msgId": key, "tgId": m.id, "date": m.date.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                                       "fileName": m.file.name, "kind": kind, "n": n, "size": len(data),
-                                      "channel": info["tgPrice"], "fetchedAt": now})
+                                      "channel": source, "fetchedAt": now})
             status["updated"].append(sid)
             log(f"{sid}: yangi {kind} — {m.file.name} ({len(data) // 1024} KB)")
         except Exception as e:  # bitta kanal xatosi boshqalarini to'xtatmasin
@@ -216,7 +287,7 @@ async def run(fb: Firebase, client, log=print):
             if "ChannelPrivate" in msg or "InviteHash" in msg or "not part" in msg.lower():
                 msg = "kanalga kirib bo'lmadi — @shifoatuz akkaunti shu kanalga a'zo bo'lishi kerak"
             elif "No user has" in msg or "Cannot find any entity" in msg or "Nobody is using" in msg:
-                msg = "kanal topilmadi — havolani tekshiring"
+                msg = "kanal topilmadi — havolani yoki papkani tekshiring"
             status["errors"][sid] = msg
             log(f"{sid}: XATO {msg}")
     fb.set("tgprice/_status", status)
@@ -242,6 +313,7 @@ async def main():
                                        "error": "Telegram sessiyasi bekor bo'lgan — tools/tg_login.py ni qayta ishga tushiring"})
             print("Telegram sessiyasi bekor bo'lgan")
             sys.exit(2)
+        await client.get_dialogs()  # chatlar ro'yxatini keshga oladi (id bo'yicha topish uchun)
         await run(fb, client)
     finally:
         await client.disconnect()
