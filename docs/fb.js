@@ -10,10 +10,11 @@
   const FS = 'https://firestore.googleapis.com/v1/projects/' + CFG.projectId + '/databases/(default)/documents';
   const AUTH = 'https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=' + CFG.apiKey;
   const TOKEN = 'https://securetoken.googleapis.com/v1/token?key=' + CFG.apiKey;
-  const LS_RT = 'fb_rt', LS_EMAIL = 'fb_email';
+  const LS_RT = 'fb_rt', LS_EMAIL = 'fb_email', LS_STAFF = 'ap_staff', LS_ADMIN = 'fb_admin';
+  const SIGNUP = 'https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=' + CFG.apiKey;
   const CHUNK = 900000; // bitta hujjatga sig'adigan base64 bo'lak (Firestore chegarasi ~1 MB)
 
-  const st = { idToken: null, exp: 0, rt: null, email: null, uid: null };
+  const st = { idToken: null, exp: 0, rt: null, email: null, uid: null, staff: '' };
   const lsGet = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } };
   const lsSet = (k, v) => { try { if (v == null) localStorage.removeItem(k); else localStorage.setItem(k, v); } catch (e) { /* ignore */ } };
 
@@ -39,6 +40,15 @@
       throw err('unavailable', m || ('HTTP ' + r.status));
     }
     setTokens(j.idToken, j.refreshToken, +j.expiresIn, j.email, j.localId);
+    lsSet(LS_ADMIN, '1');
+  }
+  async function signInAnon() {
+    let r;
+    try { r = await fetch(SIGNUP, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ returnSecureToken: true }) }); }
+    catch (e) { throw err('unavailable', 'Internet yo\'q'); }
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw err('unavailable', ((j.error && j.error.message) || ('HTTP ' + r.status)) === 'ADMIN_ONLY_OPERATION' ? 'Firebase\'da "Anonymous" kirish yoqilmagan' : ((j.error && j.error.message) || 'xato'));
+    setTokens(j.idToken, j.refreshToken, +j.expiresIn, null, j.localId); lsSet(LS_ADMIN, null); lsSet(LS_EMAIL, null); st.email = null;
   }
   function setTokens(id, rt, expiresIn, email, uid) {
     st.idToken = id; st.rt = rt; st.exp = Date.now() + (expiresIn - 120) * 1000;
@@ -158,37 +168,50 @@
   async function tgFile(sid) { const { meta, u8 } = await getChunks('tgfiles', sid); return { meta, buf: u8.buffer }; }
 
   // ---------- kirish oynasi ----------
-  function loginUI(msg) {
+  function loginUI(msg, adminMode) {
     return new Promise((resolve) => {
       const wrap = document.createElement('div');
       wrap.id = 'fbLogin';
       wrap.innerHTML = `<style>
         #fbLogin{position:fixed;inset:0;z-index:9999;display:grid;place-items:center;background:var(--bg,#f3f4f1);font:15px system-ui,sans-serif;color:var(--ink,#18201b);padding:16px}
-        #fbLogin form{width:100%;max-width:360px;background:var(--surface,#fff);border:1px solid var(--line,#dde2dc);border-radius:16px;padding:24px;box-shadow:0 8px 30px #0001}
+        #fbLogin form{width:100%;max-width:360px;background:#fff;border:1px solid #dde2dc;border-radius:16px;padding:24px;box-shadow:0 8px 30px #0001}
         #fbLogin h1{font-size:22px;margin:0 0 4px;color:#1f6b45}#fbLogin p{margin:0 0 16px;color:#6b746e;font-size:13px}
         #fbLogin label{display:block;font-size:13px;margin:10px 0 4px;color:#4a534d}
         #fbLogin input{width:100%;box-sizing:border-box;padding:11px 12px;border:1px solid #c9d0c9;border-radius:10px;font:inherit;background:#fff;color:#18201b}
-        #fbLogin button{margin-top:16px;width:100%;padding:12px;border:0;border-radius:10px;background:#1f6b45;color:#fff;font:600 15px system-ui;cursor:pointer}
-        #fbLogin button:disabled{opacity:.6}#fbLogin .e{color:#c62828;font-size:13px;margin-top:10px;min-height:18px}
+        #fbLogin .go{margin-top:16px;width:100%;padding:12px;border:0;border-radius:10px;background:#1f6b45;color:#fff;font:600 15px system-ui;cursor:pointer}
+        #fbLogin .go:disabled{opacity:.6}#fbLogin .e{color:#c62828;font-size:13px;margin-top:10px;min-height:18px}
+        #fbLogin .sw{margin-top:12px;border:0;background:none;color:#1f6b45;text-decoration:underline;cursor:pointer;font-size:13px;padding:0}
       </style>
-      <form autocomplete="on"><h1>Arzon Prays</h1><p>by Shifoat — davom etish uchun kiring</p>
-        <label>Email<input name="email" type="email" required autocomplete="username"></label>
-        <label>Parol<input name="password" type="password" required autocomplete="current-password"></label>
-        <button type="submit">Kirish</button><div class="e" role="alert"></div></form>`;
+      <form autocomplete="on"><h1>Arzon Prays</h1><p>by Shifoat</p><div class="f"></div>
+        <button class="go" type="submit">Kirish</button><div class="e" role="alert"></div>
+        <button class="sw" type="button"></button></form>`;
       document.body.appendChild(wrap);
-      const f = wrap.querySelector('form'); const e = wrap.querySelector('.e');
-      f.email.value = lsGet(LS_EMAIL) || ''; if (msg) e.textContent = msg;
-      (f.email.value ? f.password : f.email).focus();
+      const f = wrap.querySelector('form'); const e = wrap.querySelector('.e'); const box = wrap.querySelector('.f'); const sw = wrap.querySelector('.sw');
+      let admin = !!adminMode;
+      const draw = () => {
+        box.innerHTML = admin
+          ? `<label>Admin email<input name="email" type="email" required autocomplete="username"></label><label>Parol<input name="password" type="password" required autocomplete="current-password"></label>`
+          : `<label>Ismingiz<input name="staff" type="text" required maxlength="40" autocomplete="name" placeholder="masalan: Shohruh"></label>`;
+        sw.textContent = admin ? '← Ism bilan kirish' : 'Admin sifatida kirish (parol bilan)';
+        if (admin) { f.email.value = lsGet(LS_EMAIL) || ''; (f.email.value ? f.password : f.email).focus(); }
+        else { f.staff.value = lsGet(LS_STAFF) || ''; f.staff.focus(); }
+      };
+      sw.onclick = () => { admin = !admin; e.textContent = ''; draw(); };
+      draw(); if (msg) e.textContent = msg;
       f.onsubmit = async (ev) => {
-        ev.preventDefault(); e.textContent = ''; const b = f.querySelector('button'); b.disabled = true; b.textContent = 'Tekshirilmoqda…';
-        try { await signIn(f.email.value.trim(), f.password.value); wrap.remove(); resolve(); }
-        catch (x) { e.textContent = x.message || String(x); b.disabled = false; b.textContent = 'Kirish'; }
+        ev.preventDefault(); e.textContent = ''; const b = f.querySelector('.go'); b.disabled = true; b.textContent = 'Tekshirilmoqda…';
+        try {
+          if (admin) { await signIn(f.email.value.trim(), f.password.value); }
+          else { const n = f.staff.value.trim().replace(/\s+/g, ' '); if (!n) throw err('bad', 'Ismingizni yozing'); await signInAnon(); lsSet(LS_STAFF, n); st.staff = n; }
+          if (admin) { st.staff = lsGet(LS_STAFF) || 'Admin'; }
+          wrap.remove(); resolve();
+        } catch (x) { e.textContent = x.message || String(x); b.disabled = false; b.textContent = 'Kirish'; }
       };
     });
   }
 
   async function start() {
-    st.rt = lsGet(LS_RT); st.email = lsGet(LS_EMAIL);
+    st.rt = lsGet(LS_RT); st.email = lsGet(LS_EMAIL); st.staff = lsGet(LS_STAFF) || '';
     if (st.rt) {
       try { await refresh(); }
       catch (e) { if (e.code === 'unavailable') { /* internet yo'q: baribir urinib ko'ramiz */ } else await loginUI('Sessiya tugagan, qayta kiring.'); }
@@ -199,7 +222,10 @@
   window.FB = {
     blobJSON, tgFile,
     get email() { return st.email; },
-    logout() { lsSet(LS_RT, null); st.rt = null; st.idToken = null; location.reload(); },
+    get staff() { return st.staff; },
+    get isAdmin() { return lsGet(LS_ADMIN) === '1' || !!st.email; },
+    logout() { lsSet(LS_RT, null); lsSet(LS_ADMIN, null); st.rt = null; st.idToken = null; location.reload(); },
+    async adminLogin() { await loginUI('', true); location.reload(); },
     _test: { toFields, fromFields },
   };
   window.__fbReady = start();
