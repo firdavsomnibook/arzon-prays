@@ -294,6 +294,112 @@ async def run(fb: Firebase, client, log=print, folder_reader=None):
     return status
 
 
+# ---------------- ✈️ Buyurtmalarni agentlarga yuborish (sayt "Hammasiga jo'natish") ----------------
+OUTBOX_LOOP_SEC = int(os.environ.get("OUTBOX_LOOP_SEC", "540"))  # bitta ishga tushishda navbatni shuncha soniya kuzatadi
+OUTBOX_POLL = 20
+
+
+def _now():
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def out_file(fb, key, n):
+    b64 = "".join((fb.get(f"outfiles/{key}__{i}") or {}).get("b", "") for i in range(int(n or 1)))
+    return base64.b64decode(b64) if b64 else b""
+
+
+async def resolve_to(client, to, name=""):
+    """@nom, t.me/nom, +998... raqam yoki 'me' -> Telegram suhbatdoshi"""
+    v = str(to or "").strip()
+    if not v:
+        raise ValueError("manzil yo'q")
+    if v == "me":
+        return "me"
+    m = re.search(r"(?:t\.me/|telegram\.me/)([A-Za-z0-9_]+)", v, re.I)
+    if m:
+        return await client.get_entity(m.group(1))
+    if v.startswith("@"):
+        return await client.get_entity(v[1:])
+    digits = re.sub(r"\D", "", v)
+    if len(digits) >= 9:
+        if len(digits) == 9:
+            digits = "998" + digits
+        phone = "+" + digits
+        try:
+            return await client.get_entity(phone)
+        except Exception:
+            from telethon.tl.functions.contacts import ImportContactsRequest
+            from telethon.tl.types import InputPhoneContact
+            r = await client(ImportContactsRequest([InputPhoneContact(client_id=0, phone=phone, first_name=(name or "Agent")[:60], last_name="")]))
+            if r.users:
+                return r.users[0]
+            raise ValueError(f"{phone} raqami Telegram'da topilmadi (yoki raqam yashirilgan) — agentning @username'ini kiriting")
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,}", v):
+        return await client.get_entity(v)
+    raise ValueError("manzil tushunarsiz: " + v)
+
+
+async def process_outbox(fb, client, log=print):
+    box = fb.list("outbox")
+    now = dt.datetime.now(dt.timezone.utc)
+    sent = 0
+    for oid, o in sorted(box.items(), key=lambda kv: kv[1].get("at", "")):
+        st = o.get("status")
+        # eski (7 kundan) yozuvlarni tozalash
+        try:
+            age = (now - dt.datetime.fromisoformat(str(o.get("at", "")).replace("Z", "+00:00"))).days
+        except Exception:
+            age = 0
+        if st in ("sent", "error") and age > 7:
+            fb.delete(f"outbox/{oid}")
+            continue
+        if st != "queued":
+            continue
+        o["status"] = "sending"
+        fb.set(f"outbox/{oid}", o)
+        try:
+            ent = await resolve_to(client, o.get("to"), o.get("supName", ""))
+            await client.send_message(ent, o.get("text") or "Buyurtma")
+            import io
+            for f in o.get("files", []):
+                data = out_file(fb, f["key"], f.get("n"))
+                if not data:
+                    raise ValueError("fayl topilmadi: " + f.get("name", ""))
+                bio = io.BytesIO(data)
+                bio.name = f.get("name") or "buyurtma"
+                await client.send_file(ent, bio, caption=f.get("caption") or None, force_document=not f.get("photo"))
+                await asyncio.sleep(1)
+            o.update(status="sent", sentAt=_now(), error="")
+            for f in o.get("files", []):
+                for i in range(int(f.get("n") or 1)):
+                    fb.delete(f"outfiles/{f['key']}__{i}")
+            sent += 1
+            log(f"yuborildi: {o.get('supName')} -> {o.get('to')}")
+        except Exception as e:
+            msg = f"{type(e).__name__}: {e}"[:240]
+            if "No user has" in msg or "Nobody is using" in msg or "Cannot find any entity" in msg:
+                msg = "Telegram'da bunday foydalanuvchi topilmadi — manzilni tekshiring"
+            elif "FloodWait" in msg or "PeerFlood" in msg:
+                msg = "Telegram vaqtincha chekladi (juda ko'p xabar) — keyinroq qayta jo'nating"
+            o.update(status="error", error=msg)
+            log(f"XATO {o.get('supName')}: {msg}")
+        fb.set(f"outbox/{oid}", o)
+        await asyncio.sleep(3)
+    return sent
+
+
+async def outbox_loop(fb, client, seconds=OUTBOX_LOOP_SEC, log=print):
+    end = asyncio.get_event_loop().time() + seconds
+    while True:
+        try:
+            await process_outbox(fb, client, log)
+        except Exception as e:
+            log(f"navbatni o'qib bo'lmadi: {e}")
+        if asyncio.get_event_loop().time() + OUTBOX_POLL >= end:
+            break
+        await asyncio.sleep(OUTBOX_POLL)
+
+
 async def main():
     need = ["TG_API_ID", "TG_API_HASH", "TG_SESSION", "FB_BOT_EMAIL", "FB_BOT_PASSWORD"]
     miss = [k for k in need if not os.environ.get(k)]
@@ -314,7 +420,12 @@ async def main():
             print("Telegram sessiyasi bekor bo'lgan")
             sys.exit(2)
         await client.get_dialogs()  # chatlar ro'yxatini keshga oladi (id bo'yicha topish uchun)
+        try:
+            await process_outbox(fb, client)  # navbatda turgan buyurtmalar — avval shular
+        except Exception as e:
+            print(f"navbat: {e}")
         await run(fb, client)
+        await outbox_loop(fb, client)
     finally:
         await client.disconnect()
 
