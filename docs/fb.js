@@ -223,6 +223,7 @@
     blobJSON, tgFile,
     get email() { return st.email; },
     get staff() { return st.staff; },
+    setStaff(n) { n = String(n || '').trim().replace(/\s+/g, ' ').slice(0, 40); if (!n) return; st.staff = n; lsSet(LS_STAFF, n); },
     get isAdmin() { return lsGet(LS_ADMIN) === '1' || !!st.email; },
     logout() { lsSet(LS_RT, null); lsSet(LS_ADMIN, null); st.rt = null; st.idToken = null; location.reload(); },
     async adminLogin() { await loginUI('', true); location.reload(); },
