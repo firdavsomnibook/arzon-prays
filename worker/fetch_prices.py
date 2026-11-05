@@ -295,8 +295,9 @@ async def run(fb: Firebase, client, log=print, folder_reader=None):
 
 
 # ---------------- ✈️ Buyurtmalarni agentlarga yuborish (sayt "Hammasiga jo'natish") ----------------
-OUTBOX_LOOP_SEC = int(os.environ.get("OUTBOX_LOOP_SEC", "540"))  # bitta ishga tushishda navbatni shuncha soniya kuzatadi
-OUTBOX_POLL = 20
+OUTBOX_LOOP_SEC = int(os.environ.get("OUTBOX_LOOP_SEC", "19800"))  # bitta ishga tushishda ~5.5 soat ishlaydi
+OUTBOX_POLL = 10           # navbat har 10 soniyada tekshiriladi
+PRICE_EVERY = 600          # prayslar har 10 daqiqada
 
 
 def _now():
@@ -388,14 +389,22 @@ async def process_outbox(fb, client, log=print):
     return sent
 
 
-async def outbox_loop(fb, client, seconds=OUTBOX_LOOP_SEC, log=print):
-    end = asyncio.get_event_loop().time() + seconds
+async def outbox_loop(fb, client, seconds=OUTBOX_LOOP_SEC, log=print, price_fn=None):
+    loop = asyncio.get_event_loop()
+    end = loop.time() + seconds
+    next_price = loop.time() + PRICE_EVERY
     while True:
         try:
             await process_outbox(fb, client, log)
         except Exception as e:
             log(f"navbatni o'qib bo'lmadi: {e}")
-        if asyncio.get_event_loop().time() + OUTBOX_POLL >= end:
+        if price_fn and loop.time() >= next_price:
+            next_price = loop.time() + PRICE_EVERY
+            try:
+                await price_fn()
+            except Exception as e:
+                log(f"prayslarni tekshirib bo'lmadi: {e}")
+        if loop.time() + OUTBOX_POLL >= end:
             break
         await asyncio.sleep(OUTBOX_POLL)
 
@@ -425,7 +434,7 @@ async def main():
         except Exception as e:
             print(f"navbat: {e}")
         await run(fb, client)
-        await outbox_loop(fb, client)
+        await outbox_loop(fb, client, price_fn=lambda: run(fb, client))
     finally:
         await client.disconnect()
 
