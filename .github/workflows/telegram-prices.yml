@@ -2,7 +2,8 @@ name: Telegram prayslar
 
 on:
   schedule:
-    - cron: '*/10 1-18 * * *'
+    # bot ~5.5 soat uzluksiz ishlaydi (navbat har 10 soniyada); tugasa — navbatdagi darhol boshlanadi
+    - cron: '*/10 * * * *'
   workflow_dispatch: {}
 
 permissions:
@@ -15,7 +16,7 @@ concurrency:
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 14
+    timeout-minutes: 345
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -32,7 +33,7 @@ jobs:
           TG_SESSION: ${{ secrets.TG_SESSION }}
           FB_BOT_EMAIL: ${{ secrets.FB_BOT_EMAIL }}
           FB_BOT_PASSWORD: ${{ secrets.FB_BOT_PASSWORD }}
-      - name: Faollik belgisi
+      - name: Faollik belgisi (GitHub 60 kun jim turgan jadvalni o'chirib qo'ymasligi uchun)
         if: always()
         run: |
           if [ -z "$(git log -1 --since='30 days ago' --format=%H)" ]; then
