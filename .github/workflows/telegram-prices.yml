@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: telegram-prices
@@ -33,6 +34,11 @@ jobs:
           TG_SESSION: ${{ secrets.TG_SESSION }}
           FB_BOT_EMAIL: ${{ secrets.FB_BOT_EMAIL }}
           FB_BOT_PASSWORD: ${{ secrets.FB_BOT_PASSWORD }}
+      - name: Keyingi botni darhol ishga tushirish (bo'shliq bo'lmasin)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run telegram-prices.yml --ref ${{ github.ref_name }} || true
       - name: Faollik belgisi (GitHub 60 kun jim turgan jadvalni o'chirib qo'ymasligi uchun)
         if: always()
         run: |
