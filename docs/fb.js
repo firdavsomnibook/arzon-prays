@@ -77,7 +77,7 @@
   }
   const enc = (path) => path.split('/').map(encodeURIComponent).join('/');
   // har bir hujjat bitta "j" maydonida JSON matn sifatida saqlanadi (ichma-ich massivlar Firestore'da taqiqlangani uchun)
-  function toFields(obj) { return { j: { stringValue: JSON.stringify(obj) }, u: { timestampValue: new Date().toISOString() } }; }
+  function toFields(obj) { const f = { j: { stringValue: JSON.stringify(obj) }, u: { timestampValue: new Date().toISOString() } }; if (obj && typeof obj.status === 'string') f.s = { stringValue: obj.status }; return f; }
   function fromFields(f) {
     if (!f) return {};
     if (f.j && typeof f.j.stringValue === 'string') { try { return JSON.parse(f.j.stringValue); } catch (e) { return {}; } }
