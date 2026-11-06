@@ -95,6 +95,8 @@ class Firebase:
     def set(self, path, obj):
         fields = {"j": {"stringValue": json.dumps(obj, ensure_ascii=False)},
                   "u": {"timestampValue": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}}
+        if isinstance(obj, dict) and isinstance(obj.get("status"), str):
+            fields["s"] = {"stringValue": obj["status"]}  # navbatni arzon so'rov bilan topish uchun
         st, j = self._req("PATCH", f"{FS}/{self._path(path)}", {"fields": fields})
         if st != 200:
             raise RuntimeError(f"yozib bo'lmadi {path}: {st} {j}")
@@ -118,6 +120,20 @@ class Firebase:
             token = j.get("nextPageToken")
             if not token:
                 break
+        return out
+
+    def queued(self, coll):
+        """faqat status='queued' hujjatlar — bo'sh navbat 1 ta o'qish turadi (bepul limit tejaladi)"""
+        q = {"structuredQuery": {"from": [{"collectionId": coll}],
+                                 "where": {"fieldFilter": {"field": {"fieldPath": "s"}, "op": "EQUAL", "value": {"stringValue": "queued"}}}}}
+        st, j = self._req("POST", f"{FS}:runQuery", q)
+        if st != 200:
+            raise RuntimeError(f"navbatni o'qib bo'lmadi: {st} {j}")
+        out = {}
+        for r in (j if isinstance(j, list) else []):
+            d = r.get("document")
+            if d:
+                out[d["name"].rsplit("/", 1)[1]] = self._decode(d.get("fields"))
         return out
 
     def put_file(self, sid, data: bytes, prev_n: int, meta: dict) -> int:
@@ -296,7 +312,7 @@ async def run(fb: Firebase, client, log=print, folder_reader=None):
 
 # ---------------- ✈️ Buyurtmalarni agentlarga yuborish (sayt "Hammasiga jo'natish") ----------------
 OUTBOX_LOOP_SEC = int(os.environ.get("OUTBOX_LOOP_SEC", "19800"))  # bitta ishga tushishda ~5.5 soat ishlaydi
-OUTBOX_POLL = 10           # navbat har 10 soniyada tekshiriladi
+OUTBOX_POLL = 5            # navbat har 5 soniyada tekshiriladi (bo'sh navbat = 1 o'qish)
 PRICE_EVERY = 600          # prayslar har 10 daqiqada
 
 
@@ -340,8 +356,8 @@ async def resolve_to(client, to, name=""):
     raise ValueError("manzil tushunarsiz: " + v)
 
 
-async def process_outbox(fb, client, log=print):
-    box = fb.list("outbox")
+async def process_outbox(fb, client, log=print, full=True):
+    box = fb.list("outbox") if full or not hasattr(fb, "queued") else fb.queued("outbox")
     now = dt.datetime.now(dt.timezone.utc)
     sent = 0
     for oid, o in sorted(box.items(), key=lambda kv: kv[1].get("at", "")):
@@ -393,9 +409,22 @@ async def outbox_loop(fb, client, seconds=OUTBOX_LOOP_SEC, log=print, price_fn=N
     loop = asyncio.get_event_loop()
     end = loop.time() + seconds
     next_price = loop.time() + PRICE_EVERY
+    started = _now()
+    ends_at = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    next_beat = 0
+    next_full = loop.time() + 3600
     while True:
+        if loop.time() >= next_beat:  # sayt bot tirikligini ko'rsin
+            next_beat = loop.time() + 60
+            try:
+                fb.set("tgprice/_bot", {"beat": _now(), "startedAt": started, "endsAt": ends_at, "run": os.environ.get("GITHUB_RUN_NUMBER", "")})
+            except Exception as e:
+                log(f"heartbeat: {e}")
+        full = loop.time() >= next_full  # soatda bir marta to'liq ko'rib chiqish (eski yozuvlarni tozalash)
+        if full:
+            next_full = loop.time() + 3600
         try:
-            await process_outbox(fb, client, log)
+            await process_outbox(fb, client, log, full=full)
         except Exception as e:
             log(f"navbatni o'qib bo'lmadi: {e}")
         if price_fn and loop.time() >= next_price:
@@ -404,9 +433,11 @@ async def outbox_loop(fb, client, seconds=OUTBOX_LOOP_SEC, log=print, price_fn=N
                 await price_fn()
             except Exception as e:
                 log(f"prayslarni tekshirib bo'lmadi: {e}")
-        if loop.time() + OUTBOX_POLL >= end:
+        # kechasi (Toshkent 00:00–06:00) navbat sekinroq tekshiriladi — bepul limit tejaladi
+        poll = 60 if dt.datetime.now(dt.timezone.utc).hour in (19, 20, 21, 22, 23, 0) and OUTBOX_POLL < 60 and seconds > 3600 else OUTBOX_POLL
+        if loop.time() + poll >= end:
             break
-        await asyncio.sleep(OUTBOX_POLL)
+        await asyncio.sleep(poll)
 
 
 async def main():
