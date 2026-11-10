@@ -17,6 +17,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -39,8 +40,28 @@ class Firebase:
     def __init__(self, opener=urllib.request.urlopen):
         self.token = None
         self._open = opener
+        self._cred = None      # (email, parol) — kalit eskirganda qayta kirish uchun
+        self._login_at = 0.0
 
-    def _req(self, method, url, body=None, headers=None, form=False):
+    def _req(self, method, url, body=None, headers=None, form=False, _retry=True):
+        # Firebase kaliti 1 soat yashaydi; bot soatlab ishlaydi — 45 daqiqada yangilab turamiz
+        is_db = "googleapis.com/v1/projects" in url
+        if is_db and self._cred and time.time() - self._login_at > 45 * 60:
+            try:
+                self.login(*self._cred)
+            except Exception as e:
+                print(f"kalitni yangilab bo'lmadi: {e}")
+        st, j = self._req0(method, url, body, headers, form)
+        if is_db and st in (401, 403) and self._cred and _retry:
+            try:
+                self.login(*self._cred)
+            except Exception as e:
+                print(f"qayta kirib bo'lmadi: {e}")
+                return st, j
+            return self._req(method, url, body, headers, form, _retry=False)
+        return st, j
+
+    def _req0(self, method, url, body=None, headers=None, form=False):
         data = None
         h = dict(headers or {})
         if body is not None:
@@ -70,6 +91,8 @@ class Firebase:
         if st != 200:
             raise RuntimeError(f"Firebase'ga kirib bo'lmadi: {j.get('error', j)}")
         self.token = j["idToken"]
+        self._cred = (email, password)
+        self._login_at = time.time()
 
     @staticmethod
     def _path(p):
@@ -357,7 +380,14 @@ async def resolve_to(client, to, name=""):
 
 
 async def process_outbox(fb, client, log=print, full=True):
-    box = fb.list("outbox") if full or not hasattr(fb, "queued") else fb.queued("outbox")
+    if full or not hasattr(fb, "queued"):
+        box = fb.list("outbox")
+    else:
+        try:
+            box = fb.queued("outbox")
+        except Exception as e:  # arzon so'rov ishlamasa — buyurtma kechikmasin, to'liq ro'yxat o'qiladi
+            log(f"navbat so'rovi ishlamadi, to'liq o'qiyman: {e}")
+            box = fb.list("outbox")
     now = dt.datetime.now(dt.timezone.utc)
     sent = 0
     for oid, o in sorted(box.items(), key=lambda kv: kv[1].get("at", "")):
@@ -367,7 +397,7 @@ async def process_outbox(fb, client, log=print, full=True):
             age = (now - dt.datetime.fromisoformat(str(o.get("at", "")).replace("Z", "+00:00"))).days
         except Exception:
             age = 0
-        if st in ("sent", "error") and age > 7:
+        if st in ("sent", "error") and age > 3:
             fb.delete(f"outbox/{oid}")
             continue
         if st != "queued":
@@ -412,20 +442,23 @@ async def outbox_loop(fb, client, seconds=OUTBOX_LOOP_SEC, log=print, price_fn=N
     started = _now()
     ends_at = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
     next_beat = 0
-    next_full = loop.time() + 3600
+    next_full = loop.time() + 900
+    last_err = ""
     while True:
         if loop.time() >= next_beat:  # sayt bot tirikligini ko'rsin
             next_beat = loop.time() + 60
             try:
-                fb.set("tgprice/_bot", {"beat": _now(), "startedAt": started, "endsAt": ends_at, "run": os.environ.get("GITHUB_RUN_NUMBER", "")})
+                fb.set("tgprice/_bot", {"beat": _now(), "startedAt": started, "endsAt": ends_at, "run": os.environ.get("GITHUB_RUN_NUMBER", ""), "err": last_err})
             except Exception as e:
                 log(f"heartbeat: {e}")
-        full = loop.time() >= next_full  # soatda bir marta to'liq ko'rib chiqish (eski yozuvlarni tozalash)
+        full = loop.time() >= next_full  # 15 daqiqada bir marta to'liq ko'rib chiqish (ehtiyot chorasi + tozalash)
         if full:
-            next_full = loop.time() + 3600
+            next_full = loop.time() + 900
         try:
             await process_outbox(fb, client, log, full=full)
+            last_err = ""
         except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"[:200]
             log(f"navbatni o'qib bo'lmadi: {e}")
         if price_fn and loop.time() >= next_price:
             next_price = loop.time() + PRICE_EVERY
